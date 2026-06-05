@@ -2,6 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "torch",
+#   "numpy",
 # ]
 # ///
 
@@ -20,6 +21,10 @@ text = """
 hello transformer
 this is a tiny bigram model
 it predicts the next character from the current character
+i like ham and eggs
+as well as spam and peas
+kristian is a nice guy
+paul is a jerk
 """
 
 # Character vocabulary.
