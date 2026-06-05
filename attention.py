@@ -9,45 +9,23 @@
 
 import argparse
 import math
+from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import matplotlib.pyplot as plt
-import numpy as np
 
-parser = argparse.ArgumentParser(description="Train a tiny single-head self-attention language model.")
-parser.add_argument(
-    "--device",
-    type=str,
-    default="cuda" if torch.cuda.is_available() else "cpu",
-    help="Device to use for training, e.g. 'cpu' or 'cuda'.",
-)
-parser.add_argument("--steps", type=int, default=1000, help="Number of training steps.")
-parser.add_argument("--generate-tokens", type=int, default=200, help="Number of new tokens to generate.")
-parser.add_argument("--context", type=str, default="\n", help="Input text to continue from. If empty, starts from a newline character.")
-parser.add_argument("--no-plots", action="store_true", help="Do not show matplotlib plots.")
-args = parser.parse_args()
-
-device = args.device
-print(f"using device: {device}")
-
-# Tiny training text. Replace this with any small text file later.
-text = """
+DEFAULT_TEXT = """
 hello transformer
 this is a tiny single head self attention model
 it predicts the next character from the context before it
 i like ham and eggs
-i am legion
 as well as spam and peas
 kristian is a nice guy
 paul is a jerk
-i like to eat pizza
-i am a language model
-i look forward to learning more about attention
-i do not work
-i was made by kristian
 the quick brown fox jumped over the lazy dog
 she sells sea shells by the sea shore
 mary had a little lamb
@@ -58,120 +36,98 @@ attention learns which previous characters matter
 logits predict the next character
 """
 
-# Character vocabulary.
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
 
-stoi = {ch: i for i, ch in enumerate(chars)}
-itos = {i: ch for ch, i in stoi.items()}
+class Vocabulary:
+    def __init__(self, stoi, itos):
+        self.stoi = stoi
+        self.itos = itos
 
+    @classmethod
+    def from_text(cls, text):
+        chars = sorted(list(set(text)))
+        stoi = {ch: i for i, ch in enumerate(chars)}
+        itos = {i: ch for ch, i in stoi.items()}
+        return cls(stoi=stoi, itos=itos)
 
-def encode(s):
-    unknown = sorted(set(s) - set(stoi))
-    if unknown:
-        raise ValueError(
-            "Context contains characters that are not in the training vocabulary: "
-            + ", ".join(repr(c) for c in unknown)
-        )
-    return torch.tensor([stoi[c] for c in s], dtype=torch.long)
+    @property
+    def size(self):
+        return len(self.stoi)
 
+    def encode(self, s):
+        unknown = sorted(set(s) - set(self.stoi))
+        if unknown:
+            raise ValueError(
+                "Context contains characters that are not in the training vocabulary: "
+                + ", ".join(repr(c) for c in unknown)
+            )
+        return torch.tensor([self.stoi[c] for c in s], dtype=torch.long)
 
-def decode(ids):
-    return "".join(itos[int(i)] for i in ids)
-
-
-data = encode(text).to(device)
-
-batch_size = 8
-block_size = 16
-n_embd = 32
-
-
-def get_batch():
-    # Pick random starting positions.
-    ix = torch.randint(0, len(data) - block_size - 1, (batch_size,), device=device)
-
-    # x is the context.
-    # y is the next character at each position.
-    x = torch.stack([data[i : i + block_size] for i in ix])
-    y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
-    return x, y
+    def decode(self, ids):
+        return "".join(self.itos[int(i)] for i in ids)
 
 
 class SingleSelfAttentionHead(nn.Module):
-    def __init__(self, n_embd):
+    def __init__(self, n_embd, block_size):
         super().__init__()
 
-        # Each token representation is projected into query, key, and value vectors.
         self.query = nn.Linear(n_embd, n_embd, bias=False)
         self.key = nn.Linear(n_embd, n_embd, bias=False)
         self.value = nn.Linear(n_embd, n_embd, bias=False)
 
-        # Causal mask. A token can only read itself and earlier tokens.
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
 
-        # store the last attention weights for visualization only.
+        self.last_scores = None
         self.last_weights = None
 
     def forward(self, x):
-        # x shape: B, T, C
         B, T, C = x.shape
 
-        q = self.query(x)  # B, T, C
-        k = self.key(x)    # B, T, C
-        v = self.value(x)  # B, T, C
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
 
-        # Attention scores. For each token position, compare its query to all keys.
-        scores = q @ k.transpose(-2, -1)  # B, T, T
+        scores = q @ k.transpose(-2, -1)
         scores = scores / math.sqrt(C)
-
-        # Hide future positions before softmax.
         scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
 
-        # Attention weights are probabilities over context positions.
-        weights = F.softmax(scores, dim=-1)  # B, T, T
+        weights = F.softmax(scores, dim=-1)
 
-        self.last_weights = weights.detach().cpu()  # for visualization only
+        self.last_scores = scores.detach().cpu()
+        self.last_weights = weights.detach().cpu()
 
-        # Each token receives the weighted average of the value vectors it attends to.
-        out = weights @ v  # B, T, C
+        out = weights @ v
         return out
 
 
 class TinySelfAttentionLanguageModel(nn.Module):
-    def __init__(self):
+    def __init__(self, vocab_size, block_size, n_embd):
         super().__init__()
 
-        # Unlike the bigram model, token embeddings are no longer logits.
-        # They are hidden vectors that attention can operate on.
+        self.vocab_size = vocab_size
+        self.block_size = block_size
+        self.n_embd = n_embd
+
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-
-        # REPLACED HERE:
-        # The old bigram model did this:
-        #   logits = token_embedding_table(idx)
-        #
-        # Now we do this:
-        #   x = token_embedding(idx)
-        #   x = x + position_embedding
-        #   x = self_attention(x)
-        #   logits = lm_head(x)
-        self.self_attention = SingleSelfAttentionHead(n_embd)
-
-        # Final projection from hidden vectors to next-token logits.
+        self.self_attention = SingleSelfAttentionHead(n_embd, block_size)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
-        # idx shape: B, T
         B, T = idx.shape
 
-        token_emb = self.token_embedding_table(idx)  # B, T, C
-        pos = torch.arange(T, device=idx.device)     # T
-        pos_emb = self.position_embedding_table(pos) # T, C
+        if T > self.block_size:
+            raise ValueError(
+                f"Input length {T} is longer than block_size {self.block_size}. "
+                "Crop the context before calling forward, or use generate which crops internally."
+            )
 
-        x = token_emb + pos_emb                      # B, T, C
-        x = self.self_attention(x)                   # B, T, C
-        logits = self.lm_head(x)                     # B, T, vocab_size
+        token_emb = self.token_embedding_table(idx)
+        pos = torch.arange(T, device=idx.device)
+        pos_emb = self.position_embedding_table(pos)
+
+        x = token_emb + pos_emb
+        x = self.self_attention(x)
+        logits = self.lm_head(x)
 
         if targets is None:
             loss = None
@@ -184,40 +140,69 @@ class TinySelfAttentionLanguageModel(nn.Module):
         return logits, loss
 
     def generate(self, idx, max_new_tokens):
-        # idx shape: B, T
         for _ in range(max_new_tokens):
-            # Positional embeddings only exist up to block_size, so crop long context.
-            idx_context = idx[:, -block_size:]
+            idx_context = idx[:, -self.block_size :]
 
             logits, loss = self(idx_context)
-            logits = logits[:, -1, :]              # B, vocab_size
-            probs = F.softmax(logits, dim=-1)      # B, vocab_size
-            idx_next = torch.multinomial(probs, num_samples=1)  # B, 1
-            idx = torch.cat([idx, idx_next], dim=1) # B, T + 1
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, idx_next], dim=1)
 
         return idx
 
 
-model = TinySelfAttentionLanguageModel().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+def get_device(requested_device):
+    if requested_device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return requested_device
 
-losses = []
 
-for step in range(args.steps):
-    xb, yb = get_batch()
+def load_training_text(text_file):
+    if text_file is None:
+        return DEFAULT_TEXT
+    return Path(text_file).read_text(encoding="utf-8")
 
-    logits, loss = model(xb, yb)
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+def make_batcher(data, batch_size, block_size, device):
+    def get_batch():
+        ix = torch.randint(0, len(data) - block_size - 1, (batch_size,), device=device)
+        x = torch.stack([data[i : i + block_size] for i in ix])
+        y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
+        return x, y
 
-    losses.append(float(loss.detach().cpu()))
+    return get_batch
 
-    if step % 100 == 0:
-        print(step, float(loss.detach()))
 
-if not args.no_plots:
+def save_checkpoint(path, model, optimizer, vocab, config, losses, step):
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+        "stoi": vocab.stoi,
+        "itos": vocab.itos,
+        "config": config,
+        "losses": losses,
+        "step": step,
+    }
+    torch.save(checkpoint, path)
+
+
+def load_checkpoint(path, device):
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    config = checkpoint["config"]
+    vocab = Vocabulary(stoi=checkpoint["stoi"], itos=checkpoint["itos"])
+
+    model = TinySelfAttentionLanguageModel(
+        vocab_size=config["vocab_size"],
+        block_size=config["block_size"],
+        n_embd=config["n_embd"],
+    ).to(device)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return checkpoint, model, vocab, config
+
+
+def plot_loss(losses):
     plt.figure()
     plt.plot(losses)
     plt.title("Training Loss")
@@ -226,36 +211,34 @@ if not args.no_plots:
     plt.tight_layout()
     plt.show()
 
-# Generate from the model. Start with the input text or a newline if no input is provided.
-context = args.context if args.context else "\n"
 
-# The model only has positional embeddings from 0 to block_size - 1.
-# So direct model inspection must use at most block_size tokens.
-# Generation already crops internally on each step.
-context_for_model = context[-block_size:]
+def plot_next_token_probs(model, vocab, context, device):
+    context_for_model = context[-model.block_size :]
+    inspect = vocab.encode(context_for_model).unsqueeze(0).to(device)
 
-start = encode(context).unsqueeze(0).to(device)              # B, T, used for generation
-inspect = encode(context_for_model).unsqueeze(0).to(device) # B, <= block_size, used for plots
+    with torch.no_grad():
+        logits, loss = model(inspect)
+        next_logits = logits[0, -1, :]
+        probs = F.softmax(next_logits, dim=-1).detach().cpu()
 
-logits, loss = model(inspect)
-next_logits = logits[0, -1, :]
-probs = F.softmax(next_logits, dim=-1).detach().cpu()
-
-if not args.no_plots:
     plt.figure()
-    plt.bar(range(vocab_size), probs)
-    plt.xticks(
-        range(vocab_size),
-        [repr(itos[i]) for i in range(vocab_size)],
-        rotation=90,
-    )
+    plt.bar(range(vocab.size), probs)
+    plt.xticks(range(vocab.size), [repr(vocab.itos[i]) for i in range(vocab.size)], rotation=90)
     plt.title(f"Next character probabilities after {repr(context_for_model)}")
     plt.xlabel("Next character")
     plt.ylabel("Probability")
     plt.tight_layout()
     plt.show()
 
-    weights = model.self_attention.last_weights[0]  # T, T
+
+def plot_attention_weights(model, vocab, context, device):
+    context_for_model = context[-model.block_size :]
+    inspect = vocab.encode(context_for_model).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        model(inspect)
+
+    weights = model.self_attention.last_weights[0]
     labels = [repr(c) for c in context_for_model]
 
     plt.figure()
@@ -269,7 +252,129 @@ if not args.no_plots:
     plt.tight_layout()
     plt.show()
 
-out = model.generate(start, max_new_tokens=args.generate_tokens)
 
-print()
-print(decode(out[0]))
+def run_train(args):
+    device = get_device(args.device)
+    print(f"using device: {device}")
+
+    text = load_training_text(args.text_file)
+    vocab = Vocabulary.from_text(text)
+    data = vocab.encode(text).to(device)
+
+    config = {
+        "vocab_size": vocab.size,
+        "block_size": args.block_size,
+        "n_embd": args.n_embd,
+        "batch_size": args.batch_size,
+    }
+
+    model = TinySelfAttentionLanguageModel(
+        vocab_size=config["vocab_size"],
+        block_size=config["block_size"],
+        n_embd=config["n_embd"],
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    get_batch = make_batcher(data, args.batch_size, args.block_size, device)
+
+    losses = []
+
+    model.train()
+    for step in range(args.steps):
+        xb, yb = get_batch()
+
+        logits, loss = model(xb, yb)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        losses.append(float(loss.detach().cpu()))
+
+        if step % args.print_every == 0:
+            print(step, float(loss.detach().cpu()))
+
+    save_checkpoint(
+        path=args.checkpoint,
+        model=model,
+        optimizer=optimizer,
+        vocab=vocab,
+        config=config,
+        losses=losses,
+        step=args.steps,
+    )
+    print(f"saved checkpoint: {args.checkpoint}")
+
+    model.eval()
+    context = args.context if args.context else "\n"
+    start = vocab.encode(context).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        out = model.generate(start, max_new_tokens=args.generate_tokens)
+
+    print()
+    print(vocab.decode(out[0]))
+
+    if not args.no_plots:
+        plot_loss(losses)
+        plot_next_token_probs(model, vocab, context, device)
+        plot_attention_weights(model, vocab, context, device)
+
+
+def run_infer(args):
+    device = get_device(args.device)
+    print(f"using device: {device}")
+
+    checkpoint, model, vocab, config = load_checkpoint(args.checkpoint, device)
+    model.eval()
+
+    context = args.context if args.context else "\n"
+    start = vocab.encode(context).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        out = model.generate(start, max_new_tokens=args.generate_tokens)
+
+    print()
+    print(vocab.decode(out[0]))
+
+    if not args.no_plots:
+        if checkpoint.get("losses"):
+            plot_loss(checkpoint["losses"])
+        plot_next_token_probs(model, vocab, context, device)
+        plot_attention_weights(model, vocab, context, device)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train or run a tiny single head self attention language model.")
+    parser.add_argument("--mode", choices=["train", "infer"], default="train")
+    parser.add_argument("--device", type=str, default="auto", help="Device to use: auto, cpu, cuda, cuda:0, etc.")
+    parser.add_argument("--checkpoint", type=str, default="attention_checkpoint.pt")
+
+    parser.add_argument("--text-file", type=str, default=None, help="Optional UTF-8 text corpus file for training.")
+    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--n-embd", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--print-every", type=int, default=100)
+
+    parser.add_argument("--generate-tokens", type=int, default=200)
+    parser.add_argument("--context", type=str, default="\n")
+    parser.add_argument("--no-plots", action="store_true")
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if args.mode == "train":
+        run_train(args)
+    elif args.mode == "infer":
+        run_infer(args)
+    else:
+        raise ValueError(f"Unknown mode: {args.mode}")
+
+
+if __name__ == "__main__":
+    main()
