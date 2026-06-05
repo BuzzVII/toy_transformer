@@ -3,6 +3,7 @@
 # dependencies = [
 #   "torch",
 #   "numpy",
+#   "matplotlib",
 # ]
 # ///
 
@@ -13,6 +14,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import matplotlib.pyplot as plt
+import numpy as np
+
 parser = argparse.ArgumentParser(description="Train a tiny single-head self-attention language model.")
 parser.add_argument(
     "--device",
@@ -22,6 +26,8 @@ parser.add_argument(
 )
 parser.add_argument("--steps", type=int, default=1000, help="Number of training steps.")
 parser.add_argument("--generate-tokens", type=int, default=200, help="Number of new tokens to generate.")
+parser.add_argument("--context", type=str, default="\n", help="Input text to continue from. If empty, starts from a newline character.")
+parser.add_argument("--no-plots", action="store_true", help="Do not show matplotlib plots.")
 args = parser.parse_args()
 
 device = args.device
@@ -33,9 +39,23 @@ hello transformer
 this is a tiny single head self attention model
 it predicts the next character from the context before it
 i like ham and eggs
+i am legion
 as well as spam and peas
 kristian is a nice guy
 paul is a jerk
+i like to eat pizza
+i am a language model
+i look forward to learning more about attention
+i do not work
+i was made by kristian
+the quick brown fox jumped over the lazy dog
+she sells sea shells by the sea shore
+mary had a little lamb
+how much wood would a woodchuck chuck if a woodchuck could chuck wood
+it was the best of times it was the worst of times
+to be or not to be that is the question
+attention learns which previous characters matter
+logits predict the next character
 """
 
 # Character vocabulary.
@@ -47,6 +67,12 @@ itos = {i: ch for ch, i in stoi.items()}
 
 
 def encode(s):
+    unknown = sorted(set(s) - set(stoi))
+    if unknown:
+        raise ValueError(
+            "Context contains characters that are not in the training vocabulary: "
+            + ", ".join(repr(c) for c in unknown)
+        )
     return torch.tensor([stoi[c] for c in s], dtype=torch.long)
 
 
@@ -84,6 +110,9 @@ class SingleSelfAttentionHead(nn.Module):
         # Causal mask. A token can only read itself and earlier tokens.
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
 
+        # store the last attention weights for visualization only.
+        self.last_weights = None
+
     def forward(self, x):
         # x shape: B, T, C
         B, T, C = x.shape
@@ -101,6 +130,8 @@ class SingleSelfAttentionHead(nn.Module):
 
         # Attention weights are probabilities over context positions.
         weights = F.softmax(scores, dim=-1)  # B, T, T
+
+        self.last_weights = weights.detach().cpu()  # for visualization only
 
         # Each token receives the weighted average of the value vectors it attends to.
         out = weights @ v  # B, T, C
@@ -170,6 +201,8 @@ class TinySelfAttentionLanguageModel(nn.Module):
 model = TinySelfAttentionLanguageModel().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
+losses = []
+
 for step in range(args.steps):
     xb, yb = get_batch()
 
@@ -179,11 +212,63 @@ for step in range(args.steps):
     loss.backward()
     optimizer.step()
 
+    losses.append(float(loss.detach().cpu()))
+
     if step % 100 == 0:
         print(step, float(loss.detach()))
 
-# Generate from a single starting newline character.
-start = torch.tensor([[stoi["\n"]]], dtype=torch.long, device=device)
+if not args.no_plots:
+    plt.figure()
+    plt.plot(losses)
+    plt.title("Training Loss")
+    plt.xlabel("Step")
+    plt.ylabel("Cross Entropy Loss")
+    plt.tight_layout()
+    plt.show()
+
+# Generate from the model. Start with the input text or a newline if no input is provided.
+context = args.context if args.context else "\n"
+
+# The model only has positional embeddings from 0 to block_size - 1.
+# So direct model inspection must use at most block_size tokens.
+# Generation already crops internally on each step.
+context_for_model = context[-block_size:]
+
+start = encode(context).unsqueeze(0).to(device)              # B, T, used for generation
+inspect = encode(context_for_model).unsqueeze(0).to(device) # B, <= block_size, used for plots
+
+logits, loss = model(inspect)
+next_logits = logits[0, -1, :]
+probs = F.softmax(next_logits, dim=-1).detach().cpu()
+
+if not args.no_plots:
+    plt.figure()
+    plt.bar(range(vocab_size), probs)
+    plt.xticks(
+        range(vocab_size),
+        [repr(itos[i]) for i in range(vocab_size)],
+        rotation=90,
+    )
+    plt.title(f"Next character probabilities after {repr(context_for_model)}")
+    plt.xlabel("Next character")
+    plt.ylabel("Probability")
+    plt.tight_layout()
+    plt.show()
+
+    weights = model.self_attention.last_weights[0]  # T, T
+    labels = [repr(c) for c in context_for_model]
+
+    plt.figure()
+    plt.imshow(weights)
+    plt.title("Attention Weights")
+    plt.xlabel("Source position read from")
+    plt.ylabel("Target position being updated")
+    plt.xticks(range(len(labels)), labels, rotation=90)
+    plt.yticks(range(len(labels)), labels)
+    plt.colorbar()
+    plt.tight_layout()
+    plt.show()
+
 out = model.generate(start, max_new_tokens=args.generate_tokens)
 
 print()
