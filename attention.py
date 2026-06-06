@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 DEFAULT_TEXT = """
 hello transformer
-this is a tiny single head self attention model
+this is a tiny multi head self attention model
 it predicts the next character from the context before it
 i like ham and eggs
 as well as spam and peas
@@ -66,13 +66,13 @@ class Vocabulary:
         return "".join(self.itos[int(i)] for i in ids)
 
 
-class SingleSelfAttentionHead(nn.Module):
-    def __init__(self, n_embd, block_size):
+class SelfAttentionHead(nn.Module):
+    def __init__(self, n_embd, head_size, block_size):
         super().__init__()
 
-        self.query = nn.Linear(n_embd, n_embd, bias=False)
-        self.key = nn.Linear(n_embd, n_embd, bias=False)
-        self.value = nn.Linear(n_embd, n_embd, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
 
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
 
@@ -87,7 +87,7 @@ class SingleSelfAttentionHead(nn.Module):
         v = self.value(x)
 
         scores = q @ k.transpose(-2, -1)
-        scores = scores / math.sqrt(C)
+        scores = scores / math.sqrt(q.shape[-1])
         scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
 
         weights = F.softmax(scores, dim=-1)
@@ -99,17 +99,51 @@ class SingleSelfAttentionHead(nn.Module):
         return out
 
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, n_embd, n_head, block_size):
+        super().__init__()
+
+        if n_head < 1:
+            raise ValueError("n_head must be at least 1")
+        if n_embd % n_head != 0:
+            raise ValueError(
+                f"n_embd ({n_embd}) must be divisible by n_head ({n_head}) "
+                "so the concatenated heads return to n_embd."
+            )
+
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.head_size = n_embd // n_head
+
+        self.heads = nn.ModuleList(
+            [SelfAttentionHead(n_embd, self.head_size, block_size) for _ in range(n_head)]
+        )
+        self.proj = nn.Linear(n_embd, n_embd)
+
+    def forward(self, x):
+        out = torch.cat([head(x) for head in self.heads], dim=-1)
+        out = self.proj(out)
+        return out
+
+    def get_last_weights(self):
+        return [head.last_weights for head in self.heads]
+
+    def get_last_scores(self):
+        return [head.last_scores for head in self.heads]
+
+
 class TinySelfAttentionLanguageModel(nn.Module):
-    def __init__(self, vocab_size, block_size, n_embd):
+    def __init__(self, vocab_size, block_size, n_embd, n_head):
         super().__init__()
 
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.n_embd = n_embd
+        self.n_head = n_head
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.self_attention = SingleSelfAttentionHead(n_embd, block_size)
+        self.self_attention = MultiHeadAttention(n_embd, n_head, block_size)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -196,6 +230,7 @@ def load_checkpoint(path, device):
         vocab_size=config["vocab_size"],
         block_size=config["block_size"],
         n_embd=config["n_embd"],
+        n_head=config["n_head"],
     ).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -238,17 +273,37 @@ def plot_attention_weights(model, vocab, context, device):
     with torch.no_grad():
         model(inspect)
 
-    weights = model.self_attention.last_weights[0]
+    weights_by_head = model.self_attention.get_last_weights()
     labels = [repr(c) for c in context_for_model]
+    n_head = len(weights_by_head)
+    n_cols = math.ceil(math.sqrt(n_head))
+    n_rows = math.ceil(n_head / n_cols)
 
-    plt.figure()
-    plt.imshow(weights)
-    plt.title("Attention Weights")
-    plt.xlabel("Source position read from")
-    plt.ylabel("Target position being updated")
-    plt.xticks(range(len(labels)), labels, rotation=90)
-    plt.yticks(range(len(labels)), labels)
-    plt.colorbar()
+    fig, axes = plt.subplots(n_rows, n_cols, squeeze=False)
+    last_image = None
+
+    for head_index, weights in enumerate(weights_by_head):
+        row = head_index // n_cols
+        col = head_index % n_cols
+        ax = axes[row][col]
+
+        last_image = ax.imshow(weights[0])
+        ax.set_title(f"Head {head_index}")
+        ax.set_xlabel("Source position read from")
+        ax.set_ylabel("Target position being updated")
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=90)
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(labels)
+
+    for empty_index in range(n_head, n_rows * n_cols):
+        row = empty_index // n_cols
+        col = empty_index % n_cols
+        axes[row][col].axis("off")
+
+    fig.suptitle("Attention Weights by Head")
+    if last_image is not None:
+        fig.colorbar(last_image, ax=axes.ravel().tolist(), shrink=0.8)
     plt.tight_layout()
     plt.show()
 
@@ -265,6 +320,7 @@ def run_train(args):
         "vocab_size": vocab.size,
         "block_size": args.block_size,
         "n_embd": args.n_embd,
+        "n_head": args.n_head,
         "batch_size": args.batch_size,
     }
 
@@ -272,6 +328,7 @@ def run_train(args):
         vocab_size=config["vocab_size"],
         block_size=config["block_size"],
         n_embd=config["n_embd"],
+        n_head=config["n_head"],
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -345,7 +402,7 @@ def run_infer(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train or run a tiny single head self attention language model.")
+    parser = argparse.ArgumentParser(description="Train or run a tiny multi head self attention language model.")
     parser.add_argument("--mode", choices=["train", "infer"], default="train")
     parser.add_argument("--device", type=str, default="auto", help="Device to use: auto, cpu, cuda, cuda:0, etc.")
     parser.add_argument("--checkpoint", type=str, default="attention_checkpoint.pt")
@@ -355,6 +412,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--n-embd", type=int, default=32)
+    parser.add_argument("--n-head", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--print-every", type=int, default=100)
 
