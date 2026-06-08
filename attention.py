@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 DEFAULT_TEXT = """
 hello transformer
-this is a tiny multi head self attention model
+this is a tiny multi head self attention model with residual connections and layer norm
 it predicts the next character from the context before it
 i like ham and eggs
 as well as spam and peas
@@ -132,6 +132,20 @@ class MultiHeadAttention(nn.Module):
         return [head.last_scores for head in self.heads]
 
 
+class AttentionBlock(nn.Module):
+    def __init__(self, n_embd, n_head, block_size):
+        super().__init__()
+
+        self.layer_norm = nn.LayerNorm(n_embd)
+        self.self_attention = MultiHeadAttention(n_embd, n_head, block_size)
+
+    def forward(self, x):
+        # Pre norm transformer style block:
+        # normalise the stream, run attention, then add the result back to the original stream.
+        x = x + self.self_attention(self.layer_norm(x))
+        return x
+
+
 class TinySelfAttentionLanguageModel(nn.Module):
     def __init__(self, vocab_size, block_size, n_embd, n_head):
         super().__init__()
@@ -143,7 +157,7 @@ class TinySelfAttentionLanguageModel(nn.Module):
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.self_attention = MultiHeadAttention(n_embd, n_head, block_size)
+        self.attention_block = AttentionBlock(n_embd, n_head, block_size)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -160,7 +174,7 @@ class TinySelfAttentionLanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(pos)
 
         x = token_emb + pos_emb
-        x = self.self_attention(x)
+        x = self.attention_block(x)
         logits = self.lm_head(x)
 
         if targets is None:
@@ -271,7 +285,7 @@ def plot_attention_weights(model, vocab, context, device):
     with torch.no_grad():
         model(inspect)
 
-    weights_by_head = model.self_attention.get_last_weights()
+    weights_by_head = model.attention_block.self_attention.get_last_weights()
     labels = [repr(c) for c in context_for_model]
     n_head = len(weights_by_head)
     n_cols = math.ceil(math.sqrt(n_head))
@@ -399,7 +413,7 @@ def run_infer(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train or run a tiny multi head self attention language model.")
+    parser = argparse.ArgumentParser(description="Train or run a tiny multi head self attention language model with residual connections and layer norm.")
     parser.add_argument("--mode", choices=["train", "infer"], default="train")
     parser.add_argument("--device", type=str, default="auto", help="Device to use: auto, cpu, cuda, cuda:0, etc.")
     parser.add_argument("--checkpoint", type=str, default="attention_checkpoint.pt")
