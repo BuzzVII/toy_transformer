@@ -243,7 +243,6 @@ def plot_loss(losses):
     plt.title("Training Loss")
     plt.xlabel("Step")
     plt.ylabel("Cross Entropy Loss")
-    plt.tight_layout()
     plt.show()
 
 
@@ -262,7 +261,6 @@ def plot_next_token_probs(model, vocab, context, device):
     plt.title(f"Next character probabilities after {repr(context_for_model)}")
     plt.xlabel("Next character")
     plt.ylabel("Probability")
-    plt.tight_layout()
     plt.show()
 
 
@@ -304,7 +302,6 @@ def plot_attention_weights(model, vocab, context, device):
     fig.suptitle("Attention Weights by Head")
     if last_image is not None:
         fig.colorbar(last_image, ax=axes.ravel().tolist(), shrink=0.8)
-    plt.tight_layout()
     plt.show()
 
 
