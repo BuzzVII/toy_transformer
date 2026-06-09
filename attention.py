@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 DEFAULT_TEXT = """
 hello transformer
-this is a tiny multi head self attention model with residual connections and layer norm
+this is a tiny multi head self attention model with residual connections layer norm and an mlp block
 it predicts the next character from the context before it
 i like ham and eggs
 as well as spam and peas
@@ -132,32 +132,52 @@ class MultiHeadAttention(nn.Module):
         return [head.last_scores for head in self.heads]
 
 
-class AttentionBlock(nn.Module):
-    def __init__(self, n_embd, n_head, block_size):
+class MLP(nn.Module):
+    def __init__(self, n_embd, mlp_mult):
         super().__init__()
 
-        self.layer_norm = nn.LayerNorm(n_embd)
+        hidden_size = mlp_mult * n_embd
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, n_embd),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, n_embd, n_head, block_size, mlp_mult):
+        super().__init__()
+
+        self.layer_norm_1 = nn.LayerNorm(n_embd)
         self.self_attention = MultiHeadAttention(n_embd, n_head, block_size)
+        self.layer_norm_2 = nn.LayerNorm(n_embd)
+        self.mlp = MLP(n_embd, mlp_mult)
 
     def forward(self, x):
         # Pre norm transformer style block:
-        # normalise the stream, run attention, then add the result back to the original stream.
-        x = x + self.self_attention(self.layer_norm(x))
+        # 1. normalise the stream, run attention, then add that contextual update back.
+        # 2. normalise the updated stream, run the MLP, then add that per-position update back.
+        x = x + self.self_attention(self.layer_norm_1(x))
+        x = x + self.mlp(self.layer_norm_2(x))
         return x
 
 
 class TinySelfAttentionLanguageModel(nn.Module):
-    def __init__(self, vocab_size, block_size, n_embd, n_head):
+    def __init__(self, vocab_size, block_size, n_embd, n_head, mlp_mult):
         super().__init__()
 
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.n_embd = n_embd
         self.n_head = n_head
+        self.mlp_mult = mlp_mult
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.attention_block = AttentionBlock(n_embd, n_head, block_size)
+        self.transformer_block = TransformerBlock(n_embd, n_head, block_size, mlp_mult)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -174,7 +194,7 @@ class TinySelfAttentionLanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(pos)
 
         x = token_emb + pos_emb
-        x = self.attention_block(x)
+        x = self.transformer_block(x)
         logits = self.lm_head(x)
 
         if targets is None:
@@ -245,6 +265,7 @@ def load_checkpoint(path, device):
         block_size=config["block_size"],
         n_embd=config["n_embd"],
         n_head=config["n_head"],
+        mlp_mult=config.get("mlp_mult", 4),
     ).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -285,7 +306,7 @@ def plot_attention_weights(model, vocab, context, device):
     with torch.no_grad():
         model(inspect)
 
-    weights_by_head = model.attention_block.self_attention.get_last_weights()
+    weights_by_head = model.transformer_block.self_attention.get_last_weights()
     labels = [repr(c) for c in context_for_model]
     n_head = len(weights_by_head)
     n_cols = math.ceil(math.sqrt(n_head))
@@ -332,6 +353,7 @@ def run_train(args):
         "block_size": args.block_size,
         "n_embd": args.n_embd,
         "n_head": args.n_head,
+        "mlp_mult": args.mlp_mult,
         "batch_size": args.batch_size,
     }
 
@@ -340,6 +362,7 @@ def run_train(args):
         block_size=config["block_size"],
         n_embd=config["n_embd"],
         n_head=config["n_head"],
+        mlp_mult=config["mlp_mult"],
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -413,7 +436,7 @@ def run_infer(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train or run a tiny multi head self attention language model with residual connections and layer norm.")
+    parser = argparse.ArgumentParser(description="Train or run a tiny multi head self attention language model with residual connections, layer norm, and an MLP block.")
     parser.add_argument("--mode", choices=["train", "infer"], default="train")
     parser.add_argument("--device", type=str, default="auto", help="Device to use: auto, cpu, cuda, cuda:0, etc.")
     parser.add_argument("--checkpoint", type=str, default="attention_checkpoint.pt")
@@ -424,6 +447,7 @@ def parse_args():
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--n-embd", type=int, default=32)
     parser.add_argument("--n-head", type=int, default=4)
+    parser.add_argument("--mlp-mult", type=int, default=4, help="MLP hidden size multiplier. 4 means hidden size is 4 * n_embd.")
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--print-every", type=int, default=100)
 
